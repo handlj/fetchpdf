@@ -24,9 +24,6 @@ import base64
 import json
 import os
 import re
-import shutil
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -44,6 +41,8 @@ from .._http import POLITE_USER_AGENT, headers_for
 MAX_PDF_BYTES = 300 * 1024 * 1024
 
 SOURCE = "institutional_cookies"
+#: Provenance label for a PDF reached by following LibKey (see libkey.py).
+SOURCE_LIBKEY = "institutional_libkey"
 
 
 # --------------------------------------------------------------------------
@@ -122,6 +121,11 @@ def reload_cookie_source() -> None:
     global _live_file, _live_resolved
     with _source_lock:
         _live_file, _live_resolved = None, False
+
+
+def institutional_disabled() -> bool:
+    """True when this process was told not to use institutional access (--no-cookies)."""
+    return _disabled
 
 
 def cookies_user_managed() -> bool:
@@ -782,39 +786,12 @@ def fetch_with_cookies(doi, save_path, cookies, verbose=False,
 # when one is available so batch workers do not open windows on the user's
 # screen; the display is started once per process and shared.
 _CHALLENGE_TITLES = ("just a moment", "attention required", "verify you are human")
-_xvfb_lock = threading.Lock()
-_xvfb_display: Optional[str] = None
-_xvfb_proc = None
 
 
 def _browser_display() -> Optional[str]:
-    """An X display for headed Chromium: a shared private Xvfb, else $DISPLAY."""
-    global _xvfb_display, _xvfb_proc
-    if os.name == "nt" or sys.platform == "darwin":
-        return ""
-    if os.environ.get("FETCHPDF_INSTITUTIONAL_VISIBLE") and os.environ.get("DISPLAY"):
-        return os.environ["DISPLAY"]
-    with _xvfb_lock:
-        if _xvfb_display and _xvfb_proc and _xvfb_proc.poll() is None:
-            return _xvfb_display
-        xvfb = shutil.which("Xvfb")
-        if xvfb:
-            for n in range(120, 140):
-                if os.path.exists(f"/tmp/.X{n}-lock"):
-                    continue
-                try:
-                    proc = subprocess.Popen(
-                        [xvfb, f":{n}", "-screen", "0", "1400x900x24", "-nolisten", "tcp"],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except OSError:
-                    break
-                time.sleep(1.0)
-                if proc.poll() is None:
-                    _xvfb_proc, _xvfb_display = proc, f":{n}"
-                    import atexit
-                    atexit.register(proc.terminate)
-                    return _xvfb_display
-    return os.environ.get("DISPLAY")
+    """The X display for a headed browser (see retrieval/display.py), or None."""
+    from . import display
+    return display.browser_display()
 
 
 def _playwright_cookies(cookies: Sequence[dict], sites) -> List[dict]:
@@ -884,6 +861,77 @@ def fetch_pdf_in_page(page, url: str) -> Tuple[Optional[bytes], dict]:
     data = base64.b64decode(info.pop("b64")) if info.get("b64") else None
     return data, info
 
+def navigate_for_pdf(page, url: str, referer: Optional[str] = None,
+                     timeout_ms: int = 60000) -> Tuple[Optional[bytes], dict]:
+    """Load *url* as a top-level navigation and return (pdf bytes or None, info).
+
+    Cloudflare's bot rules on publisher PDF endpoints (Wiley, T&F, SAGE, seen
+    2026-11-17 from a campus IP) refuse a script's fetch() -- Sec-Fetch-Mode:
+    cors -- with 403, but let a navigation through, as for a reader clicking
+    "Download PDF". The PDF then arrives either as a download (pdfdirect /
+    ?download=true) or inline in the browser's viewer; both are handled.
+
+    ``download=true`` is added when absent: opened inline, a PDF lands in
+    Chrome's viewer and the navigation response body is only the viewer's
+    ~600-byte stub (seen on SAGE and Science), while Atypon hosts answer
+    ``?download=true`` with an attachment Playwright can save.
+    """
+    if "download=" not in url:
+        url += ("&" if "?" in url else "?") + "download=true"
+    downloads = []
+
+    # A named function: Playwright's sync API sets an attribute on the
+    # handler, which a builtin such as list.append refuses (AttributeError).
+    def _on_download(download):
+        downloads.append(download)
+
+    page.on("download", _on_download)
+    response, info = None, {"via": "navigate"}
+    try:
+        try:
+            response = page.goto(url, wait_until="commit", timeout=timeout_ms,
+                                 referer=referer)
+        except Exception as exc:      # noqa: BLE001
+            # Chromium aborts a navigation that turns into a download
+            # ("net::ERR_ABORTED" / "Download is starting"): not an error.
+            info["goto_error"] = type(exc).__name__
+        # Give a download a moment to start.
+        for _ in range(10):
+            if downloads:
+                break
+            page.wait_for_timeout(500)
+
+        if downloads:
+            download = downloads[0]
+            path = download.path()            # blocks until the download finished
+            info["status"], info["download"] = 200, True
+            if not path:
+                info["failure"] = download.failure()
+                return None, info
+            size = os.path.getsize(path)
+            info["n"] = size
+            if size > MAX_PDF_BYTES:
+                return None, info
+            data = Path(path).read_bytes()
+            return (data if data[:4] == b"%PDF" else None), info
+
+        if response is None:
+            return None, info
+        info["status"] = response.status
+        info["url"] = response.url
+        try:
+            response.finished()               # wait for the body (wait_until="commit")
+            data = response.body()
+        except Exception as exc:      # noqa: BLE001 - body not retrievable
+            info["body_error"] = type(exc).__name__
+            return None, info
+        info["n"] = len(data)
+        if data[:4] != b"%PDF" or len(data) > MAX_PDF_BYTES:
+            return None, info
+        return data, info
+    finally:
+        page.remove_listener("download", _on_download)
+
 
 def fetch_in_browser(doi, save_path, cookies, user_agent=None,
                      verbose=False) -> Optional[str]:
@@ -899,15 +947,13 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
         if verbose:
             print("  institutional: playwright not installed; no browser fallback")
         return None
-    display = _browser_display()
-    if display is None:
+    from . import display as _display
+    env = _display.browser_launch_env()
+    if env is None:
         if verbose:
-            print("  institutional: no display and no Xvfb; no browser fallback")
+            print("  institutional: no display for a headed browser; no browser fallback")
         return None
     sites = publisher_sites(doi)
-    env = dict(os.environ)
-    if display:
-        env["DISPLAY"] = display
     try:
         with sync_playwright() as driver:
             # Headed is load-bearing. The installed Chrome when there is one: the
@@ -915,14 +961,16 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
             # the browser that earned it.
             launch = dict(headless=False, env=env,
                           ignore_default_args=["--enable-automation"],
-                          args=["--disable-blink-features=AutomationControlled"])
+                          args=_display.browser_launch_args(
+                              ["--disable-blink-features=AutomationControlled"]))
             try:
                 browser = driver.chromium.launch(channel="chrome", **launch)
             except Exception:      # noqa: BLE001 - no Chrome; Playwright's Chromium
                 browser = driver.chromium.launch(**launch)
             try:
                 context = browser.new_context(user_agent=user_agent or None,
-                                              viewport={"width": 1400, "height": 900})
+                                              viewport={"width": 1400, "height": 900},
+                                              accept_downloads=True)
                 context.add_cookies(_playwright_cookies(cookies, sites))
                 page = context.new_page()
                 page.goto(article, wait_until="domcontentloaded", timeout=60000)
@@ -936,7 +984,10 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
                     pdf_urls = [pdf] if pdf else []
                     if verbose and not pdf:
                         print(f"  institutional (browser): no citation_pdf_url at {page.url}")
+                landing = page.url
                 for url in pdf_urls:
+                    # 1. Script fetch() from inside the page -- works for Science,
+                    #    PNAS, AHA and the HighWire/Silverchair landing route.
                     try:
                         data, info = fetch_pdf_in_page(page, url)
                     except Exception:      # noqa: BLE001 - the page was still settling
@@ -954,6 +1005,30 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
                               f"{' PDF' if data else ''}")
                     if data and _write_pdf_bytes(data, save_path):
                         return url
+
+                    # 2. Navigation, as a reader clicking the link. Cloudflare's
+                    #    PDF-endpoint rules refuse fetch() on Wiley/T&F/SAGE.
+                    data, info = navigate_for_pdf(page, url, referer=landing)
+                    if not data and info.get("status") == 403:
+                        # The navigation may have hit a fresh challenge page:
+                        # let it clear, then try once more.
+                        if wait_past_challenge(page):
+                            data, info = navigate_for_pdf(page, url, referer=landing)
+                    if verbose:
+                        print(f"  institutional (browser, navigate): {url} -> "
+                              f"HTTP {info.get('status')}"
+                              f"{' download' if info.get('download') else ''}"
+                              f"{' PDF' if data else ''}")
+                    if data and _write_pdf_bytes(data, save_path):
+                        return url
+                    # Back to the landing page before the next candidate URL, so
+                    # the next fetch() runs on the publisher's origin again.
+                    if page.url != landing:
+                        try:
+                            page.goto(landing, wait_until="domcontentloaded", timeout=60000)
+                            wait_past_challenge(page)
+                        except Exception:      # noqa: BLE001
+                            pass
             finally:
                 browser.close()
     except Exception as exc:      # noqa: BLE001 - never fail a record on this
@@ -963,37 +1038,63 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
 
 
 def fetch(doi, save_path, cookies_path, verbose=False,
-          accept=None, on_download=None) -> Tuple[Optional[str], List[str]]:
-    """Run the cookie route. Returns ``(saved_path or None, reasons)``.
+          accept=None, on_download=None,
+          source_out: Optional[list] = None) -> Tuple[Optional[str], List[str]]:
+    """Run the institutional route. Returns ``(saved_path or None, reasons)``.
+
+    First the cookie route (publisher PDF URL, browser fallback), when there is
+    a cookie file and the DOI prefix is covered; then, when a LibKey library ID
+    is configured (``FETCHPDF_LIBKEY_LIBRARY``), LibKey, which also reaches
+    copies licensed through an aggregator (Ovid, EBSCO) and uncovered prefixes.
 
     ``accept(path, url)`` is the caller's identity check; a PDF that fails it
-    is not a result. ``on_download(path, url)`` records provenance.
+    is not a result. ``on_download(path, url)`` records provenance. The source
+    that produced the PDF (SOURCE or SOURCE_LIBKEY) is appended to
+    *source_out* when given.
     """
-    if not cookies_path:
+    from . import libkey
+    use_libkey = bool(libkey.library_id()) and not _disabled
+    if not cookies_path and not use_libkey:
         return None, []
-    if not covers(doi):
+    if not covers(doi) and not use_libkey:
         return None, ["no publisher PDF URL is known for this DOI prefix"]
     if _cap_reached():
         return None, [f"download cap reached ({_max_downloads} this run); "
                       "raise it with --cookies-max"]
-    try:
-        cookies = load_cookies(cookies_path)
-    except (OSError, ValueError) as exc:
-        return None, [f"cookie file could not be read ({type(exc).__name__})"]
-    user_agent = load_user_agent(cookies_path)
-    url, challenged = fetch_with_cookies(doi, save_path, cookies, verbose=verbose,
-                                         user_agent=user_agent)
-    if not url and challenged:
-        url = fetch_in_browser(doi, save_path, cookies, user_agent=user_agent,
-                               verbose=verbose)
+    url, source, reasons = None, SOURCE, []
+    user_agent = load_user_agent(cookies_path) if cookies_path else None
+    if cookies_path and covers(doi):
+        try:
+            cookies = load_cookies(cookies_path)
+        except (OSError, ValueError) as exc:
+            cookies = None
+            reasons.append(f"cookie file could not be read ({type(exc).__name__})")
+        if cookies is not None:
+            url, challenged = fetch_with_cookies(doi, save_path, cookies, verbose=verbose,
+                                                 user_agent=user_agent)
+            if not url and challenged:
+                url = fetch_in_browser(doi, save_path, cookies, user_agent=user_agent,
+                                       verbose=verbose)
+            if not url:
+                reasons.append("the publisher did not serve a PDF with these cookies "
+                               "(expired session, or no subscription)")
+    if not url and use_libkey:
+        url = libkey.fetch_via_libkey(doi, save_path, user_agent=user_agent,
+                                      verbose=verbose)
+        if url:
+            source = SOURCE_LIBKEY
+        else:
+            reasons.append("LibKey found no copy the library's network can open "
+                           "(not licensed, or off campus without VPN)")
     if not url:
         _note_attempt(doi, False)
-        return None, ["the publisher did not serve a PDF with these cookies "
-                      "(expired session, or no subscription)"]
+        return None, reasons
     if on_download:
         on_download(save_path, url)
     if accept is None or accept(save_path, url):
         _count_download()
         _note_attempt(doi, True)
+        if source_out is not None:
+            source_out.append(source)
         return save_path, []
-    return None, ["the publisher's PDF failed the identity check"]
+    return None, ["the library's PDF failed the identity check"]

@@ -26,7 +26,8 @@ from ._env import (
     S2_API_KEY as _S2_API_KEY,
 )
 from ._http import (USER_AGENT, POLITE_USER_AGENT, headers_for,
-                    elsevier_first_page_only, elsevier_headers)
+                    elsevier_first_page_only, elsevier_headers,
+                    elsevier_refusal_code, warn_elsevier_refusal)
 from .retrieval._util import unlink as _unlink_quietly
 
 # The ID Converter moved: www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/ now 301s
@@ -190,6 +191,7 @@ SOURCE_DISPLAY_NAMES = {
     "pmid_direct": "PubMed",
     "psycharchives": "PsychArchives",
     "institutional_cookies": "Institutional (cookies)",
+    "institutional_libkey": "Institutional (LibKey)",
     "semantic_scholar": "SemanticScholar",
     "serpapi_scholar": "GoogleScholar (SerpApi)",
     "ssrn": "SSRN",
@@ -3237,8 +3239,11 @@ def _try_elsevier_pdf_by_pii(pii: str, save_path: str, api_key: str, verbose=Fal
         return None
 
     if r.status_code != 200:
+        code = elsevier_refusal_code(r.status_code, getattr(r, "content", b""))
         if verbose:
-            print(f"  Elsevier PDF status {r.status_code} for {pii}")
+            print(f"  Elsevier PDF status {r.status_code} for {pii}"
+                  + (f" ({code})" if code else ""))
+        warn_elsevier_refusal(code)
         return None
     content = getattr(r, "content", None)
     if not content or not content.startswith(b"%PDF"):
@@ -3252,6 +3257,7 @@ def _try_elsevier_pdf_by_pii(pii: str, save_path: str, api_key: str, verbose=Fal
     if elsevier_first_page_only(getattr(r, "headers", None)):
         print(f"  Elsevier PDF: first-page preview only for {pii} "
               f"(key not entitled to this record's PDF); discarding")
+        warn_elsevier_refusal("FIRST_PAGE_ONLY")
         return None
 
     try:
@@ -3417,8 +3423,11 @@ def try_elsevier_fulltext_api_fallback(doi: str, save_path: str, crossref_messag
         r = requests.get(api_url, timeout=45, headers=elsevier_headers(
             api_key, {"User-Agent": headers["User-Agent"]}))
         if r.status_code != 200:
+            code = elsevier_refusal_code(r.status_code, getattr(r, "content", b""))
             if verbose:
-                print(f"  Elsevier API status {r.status_code} for {pii}")
+                print(f"  Elsevier API status {r.status_code} for {pii}"
+                      + (f" ({code})" if code else ""))
+            warn_elsevier_refusal(code)
             return None
 
         xml_text = r.text
@@ -4178,10 +4187,14 @@ def _try_institutional(save_path, resolved, cookies_file=None, verbose=False,
     if not resolved:
         return None
     from .retrieval import institutional as _institutional
-    if not _institutional.covers(resolved):
+    from .retrieval import libkey as _libkey
+    # LibKey (FETCHPDF_LIBKEY_LIBRARY) reaches aggregator copies and prefixes
+    # the cookie route does not cover; --no-cookies turns it off as well.
+    use_libkey = bool(_libkey.library_id()) and not _institutional.institutional_disabled()
+    if not _institutional.covers(resolved) and not use_libkey:
         return None
     cookies_file = cookies_file or _institutional.active_cookies_file()
-    if not cookies_file:
+    if not cookies_file and not use_libkey:
         return None
 
     def accept(path, url):
@@ -4189,10 +4202,11 @@ def _try_institutional(save_path, resolved, cookies_file=None, verbose=False,
         # is a reason to be allowed the file, not a reason to trust it.
         return _accept_downloaded_pdf(path, resolved, url=url, verbose=verbose)
 
+    sources = []
     try:
         path, reasons = _institutional.fetch(
             resolved, save_path, cookies_file, verbose=verbose,
-            accept=accept, on_download=_note_download_url,
+            accept=accept, on_download=_note_download_url, source_out=sources,
         )
     except Exception as e:      # noqa: BLE001 - never fail a record on this
         if verbose:
@@ -4201,7 +4215,7 @@ def _try_institutional(save_path, resolved, cookies_file=None, verbose=False,
     if path:
         if verbose:
             print(f"✅ Institutional access success for {resolved}")
-        _record_source(_source_out, _institutional.SOURCE)
+        _record_source(_source_out, sources[0] if sources else _institutional.SOURCE)
         return path
     # Printed whether or not --verbose is on: "no subscription" and "stale
     # cookies" call for different fixes, and the user can only tell them apart
@@ -7304,7 +7318,9 @@ def _offer_cookie_import(failed, retry, xml_only=False):
               f"covers. If your library sign-in there has lapsed, signing in again may get them.")
         command = f"fetchpdf cookies refresh --publishers {','.join(publishers)}"
     question = f"   Sign in to {who} through your library and retry them? [y/N]: "
-    if not _stdio_is_interactive():
+    from .retrieval import display as _display
+    # Hidden browser windows mean "run undisturbed": no prompt, no sign-in tabs.
+    if not _stdio_is_interactive() or _display.hidden():
         print(f"   To try: `{command}`, then re-run the failures with --cookies-only "
               f"(failed_dois.csv has a doi column).")
         return []
@@ -7799,6 +7815,17 @@ def _main(argv=None, json_out=None):
         help="Skip the Playwright-based scrapers even when Playwright is installed."
     )
     parser.add_argument(
+        "--browser-windows",
+        choices=["hidden", "visible"],
+        default=None,
+        help="Where the browsers fetchpdf drives (Cloudflare fallback, LibKey, WAF "
+             "and Atypon SI routes) show their windows. hidden (default): on a private "
+             "invisible display (needs Xvfb), so a run never opens windows on your "
+             "desktop and can go on in the background; it also skips the end-of-run "
+             "offer to open sign-in tabs. visible: on your desktop, to watch or debug a "
+             "route. Overrides FETCHPDF_BROWSER_WINDOWS."
+    )
+    parser.add_argument(
         "--start-from-row",
         type=int,
         default=0,
@@ -8157,6 +8184,9 @@ def _main(argv=None, json_out=None):
     if args.cookies_file and not os.path.isfile(args.cookies_file):
         print(f"❌ --cookies: no such file: {args.cookies_file}")
         return 2
+    from .retrieval import display as _display
+    if args.browser_windows:
+        _display.set_browser_windows(args.browser_windows)
     from .retrieval import institutional as _institutional
     if args.no_cookies:
         _institutional.disable_cookies()

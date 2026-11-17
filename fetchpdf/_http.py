@@ -3,6 +3,9 @@
 Its own module because fetchpdf imports download_from_aa, so the
 latter cannot import back from the former at module scope without a cycle.
 """
+import re
+import threading
+from typing import Optional
 
 # Keep the Chrome version current: some hosts (Zenodo among them) 403 stale
 # Chrome UAs as a bot signal, which silently breaks every source on that host.
@@ -101,6 +104,69 @@ def elsevier_headers(api_key: str, extra: dict = None) -> dict:
         out["X-ELS-Insttoken"] = _env.ELSEVIER_INSTTOKEN
     out.update(extra or {})
     return out
+
+
+_ELSEVIER_ERROR_CODE_RES = (
+    re.compile(rb"<error-code>\s*([A-Z_]+)\s*</error-code>"),
+    re.compile(rb'"statusCode"\s*:\s*"([A-Z_]+)"'),
+)
+
+#: What each Elsevier refusal means for the user, printed once per run.
+_ELSEVIER_ADVICE = {
+    "APIKEY_INVALID": "the API key is invalid -- check ELSEVIER_TDM_API_KEY "
+                      "(a 32-character key from dev.elsevier.com)",
+    "INSTTOKEN_INVALID": "the institutional token is invalid -- check or clear "
+                         "ELSEVIER_INSTTOKEN",
+    "AUTHENTICATION_ERROR": "the key is valid but not linked to your institution -- ask "
+                            "your library for an Elsevier institutional token "
+                            "(ELSEVIER_INSTTOKEN), or run on the campus network/VPN",
+    "FIRST_PAGE_ONLY": "only first-page previews are served to this key/network -- if "
+                       "this repeats for journals your library subscribes to, Elsevier "
+                       "does not recognise you as the institution: ask your library for "
+                       "an institutional token (ELSEVIER_INSTTOKEN)",
+}
+_elsevier_warned: set = set()
+_elsevier_warn_lock = threading.Lock()
+
+
+def elsevier_refusal_code(status, content=b"", headers=None) -> Optional[str]:
+    """Why Elsevier refused a request, as a code, or None if it did not.
+
+    APIKEY_INVALID / INSTTOKEN_INVALID / AUTHENTICATION_ERROR come from the error
+    payload of a 401/403 (XML ``<error-code>`` or JSON ``statusCode``);
+    FIRST_PAGE_ONLY from the X-ELS-Status header of a partial 200. Without a
+    code these all used to read "not entitled", which sent users looking for a
+    missing subscription when the key itself was the problem (seen 2026-11-17:
+    a 17-character placeholder key, 401 APIKEY_INVALID on every request).
+    """
+    if status in (401, 403):
+        head = (content or b"")[:4096]
+        if isinstance(head, str):
+            head = head.encode("utf-8", "replace")
+        for rx in _ELSEVIER_ERROR_CODE_RES:
+            m = rx.search(head)
+            if m:
+                return m.group(1).decode()
+        return "AUTHENTICATION_ERROR" if status == 403 else "APIKEY_INVALID"
+    if elsevier_first_page_only(headers):
+        return "FIRST_PAGE_ONLY"
+    return None
+
+
+def warn_elsevier_refusal(code: Optional[str]) -> None:
+    """Print what an Elsevier refusal means -- once per code per process.
+
+    Printed without --verbose: an unusable key silently costs every 10.1016
+    record its best route.
+    """
+    if not code:
+        return
+    with _elsevier_warn_lock:
+        if code in _elsevier_warned:
+            return
+        _elsevier_warned.add(code)
+    advice = _ELSEVIER_ADVICE.get(code, "see the Elsevier API response")
+    print(f"⚠️  Elsevier API ({code}): {advice}")
 
 
 def elsevier_first_page_only(headers) -> bool:

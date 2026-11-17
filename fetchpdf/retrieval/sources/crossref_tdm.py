@@ -26,7 +26,8 @@ import re
 from typing import Optional
 
 from ..._env import ELSEVIER_TDM_API_KEY
-from ..._http import elsevier_first_page_only
+from ..._http import (elsevier_first_page_only, elsevier_refusal_code,
+                      warn_elsevier_refusal)
 from ..artifact import Artifact
 from ..tiers import Tier
 
@@ -61,7 +62,9 @@ def fetch_elsevier_tdm(ids, ctx) -> Optional[Artifact]:
         timeout=60,
     )
     if response.status in (401, 403):
-        ctx.log(f"    Elsevier TDM: not entitled (HTTP {response.status})")
+        code = elsevier_refusal_code(response.status, response.content)
+        ctx.log(f"    Elsevier TDM: refused (HTTP {response.status}, {code})")
+        warn_elsevier_refusal(code)
         return None
     if not response.ok or not response.content:
         ctx.log(f"    Elsevier TDM: HTTP {response.status}")
@@ -110,7 +113,9 @@ def fetch_elsevier_pdf(ids, ctx) -> Optional[Artifact]:
         timeout=90,
     )
     if response.status in (401, 403):
-        ctx.log(f"    Elsevier PDF: not entitled (HTTP {response.status})")
+        code = elsevier_refusal_code(response.status, response.content)
+        ctx.log(f"    Elsevier PDF: refused (HTTP {response.status}, {code})")
+        warn_elsevier_refusal(code)
         return None
     if not response.ok or not response.content:
         ctx.log(f"    Elsevier PDF: HTTP {response.status}")
@@ -128,6 +133,7 @@ def fetch_elsevier_pdf(ids, ctx) -> Optional[Artifact]:
     # response headers still exist -- an Artifact does not carry them.
     if elsevier_first_page_only(response.headers):
         ctx.log("    Elsevier PDF: first-page preview only (not entitled to full PDF)")
+        warn_elsevier_refusal("FIRST_PAGE_ONLY")
         return None
 
     return Artifact(

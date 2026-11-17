@@ -86,61 +86,12 @@ def note_blocked(ctx, provider: str, url: str, detail: str) -> None:
 
 
 def headed_browser_available() -> bool:
-    """Whether a headed Chromium can actually be launched here.
+    """Whether a headed Chromium can run in the current --browser-windows mode.
 
-    On Linux that needs a display: either a real one ($DISPLAY) or xvfb. On
-    Windows and macOS headed mode works directly. Returning False makes the
-    caller degrade to its warning rather than raising.
+    Kept here for callers that import it; the decision lives in display.py.
     """
-    if os.name == "nt" or os.sys.platform == "darwin":
-        return True
-    if os.environ.get("DISPLAY"):
-        return True
-    return shutil.which("xvfb-run") is not None or shutil.which("Xvfb") is not None
-
-
-def _start_xvfb(ctx):
-    """A virtual X display for headed Chromium, or None.
-
-    Returns the Popen so the caller can stop it. Uses a high display number to
-    avoid colliding with a real session, and verifies the server actually came
-    up rather than assuming.
-    """
-    import subprocess
-    import time as _time
-    xvfb = shutil.which("Xvfb")
-    if not xvfb:
-        return None
-    for display in range(99, 110):
-        lock = f"/tmp/.X{display}-lock"
-        if os.path.exists(lock):
-            continue
-        try:
-            proc = subprocess.Popen(
-                [xvfb, f":{display}", "-screen", "0", "1400x900x24", "-nolisten", "tcp"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            return None
-        _time.sleep(1.0)
-        if proc.poll() is None:
-            os.environ["DISPLAY"] = f":{display}"
-            return proc
-        return None
-    return None
-
-
-def _stop_xvfb(proc) -> None:
-    if proc is None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    os.environ.pop("DISPLAY", None)
+    from .display import headed_browser_available as _available
+    return _available()
 
 
 def fetch_atypon_supplements(ids, ctx) -> List[SupplementFile]:
@@ -165,16 +116,14 @@ def fetch_atypon_supplements(ids, ctx) -> List[SupplementFile]:
         ctx.log("    atypon SI: playwright not installed")
         return []
 
-    # Headed Chromium needs a display. On a headless Linux box there is none,
-    # so start a virtual one for the duration -- Playwright reads $DISPLAY at
-    # launch. Windows/macOS need nothing.
-    virtual_display = None
-    if os.name != "nt" and os.sys.platform != "darwin" \
-            and not os.environ.get("DISPLAY"):
-        virtual_display = _start_xvfb(ctx)
-        if virtual_display is None:
-            ctx.log("    atypon SI: could not start a virtual display")
-            return []
+    # Headed Chromium needs a display: the private Xvfb when windows are hidden
+    # (the default), the user's own when --browser-windows visible. Passed as
+    # the launch's env, never set in os.environ, which other workers share.
+    from .display import browser_launch_args, browser_launch_env
+    env = browser_launch_env()
+    if env is None:
+        ctx.log("    atypon SI: no display for a headed browser")
+        return []
 
     listing = _SUPPL_PATH.format(host=host, doi=doi)
     scratch = tempfile.mkdtemp(prefix=".fetchpdf-atypon-")
@@ -185,9 +134,11 @@ def fetch_atypon_supplements(ids, ctx) -> List[SupplementFile]:
             context = p.chromium.launch_persistent_context(
                 os.path.join(scratch, "profile"),
                 headless=False,          # load-bearing; see module docstring
+                env=env,
                 accept_downloads=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"],
+                args=browser_launch_args(
+                    ["--no-sandbox", "--disable-setuid-sandbox",
+                     "--disable-blink-features=AutomationControlled"]),
                 viewport={"width": 1400, "height": 900},
                 user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
@@ -254,8 +205,6 @@ def fetch_atypon_supplements(ids, ctx) -> List[SupplementFile]:
                     pass
     except Exception as error:
         ctx.log(f"    atypon SI: {str(error).splitlines()[0][:100]}")
-    finally:
-        _stop_xvfb(virtual_display)
 
     if not files:
         # Nothing to keep the scratch dir for.

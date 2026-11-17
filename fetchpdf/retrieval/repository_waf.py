@@ -109,11 +109,13 @@ def fetch_json_through_browser(api_url: str, doi: str, ctx) -> Optional[dict]:
     if not landing_template:
         return None
 
-    from .supplement_atypon import (_start_xvfb, _stop_xvfb,
-                                    headed_browser_available)
+    from .display import browser_launch_args, browser_launch_env
 
-    if not headed_browser_available():
-        ctx.log("    repository WAF: no display and no xvfb; cannot solve challenge")
+    # The private Xvfb when windows are hidden (the default), the user's own
+    # display with --browser-windows visible; passed as env, never os.environ.
+    env = browser_launch_env()
+    if env is None:
+        ctx.log("    repository WAF: no display for a headed browser; cannot solve challenge")
         return None
     try:
         from playwright.sync_api import sync_playwright
@@ -121,11 +123,10 @@ def fetch_json_through_browser(api_url: str, doi: str, ctx) -> Optional[dict]:
         ctx.log("    repository WAF: playwright not installed; cannot solve challenge")
         return None
 
-    virtual_display = None
     try:
-        virtual_display = _start_xvfb(ctx)
         with sync_playwright() as driver:
-            browser = driver.chromium.launch(headless=False)  # load-bearing
+            browser = driver.chromium.launch(              # headed is load-bearing
+                headless=False, env=env, args=browser_launch_args())
             try:
                 page = browser.new_context(
                     viewport={"width": 1400, "height": 900}).new_page()
@@ -152,5 +153,3 @@ def fetch_json_through_browser(api_url: str, doi: str, ctx) -> Optional[dict]:
     except Exception as exc:                       # noqa: BLE001 - never fail the record
         ctx.log(f"    repository WAF: browser fallback failed ({type(exc).__name__})")
         return None
-    finally:
-        _stop_xvfb(virtual_display)
