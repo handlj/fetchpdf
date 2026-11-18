@@ -85,3 +85,14 @@ def text_pdf(lines=(), doi="10.1234/test"):
     out += (b"trailer\n<</Size " + str(highest + 1).encode() + b"/Root 1 0 R>>\n"
             b"startxref\n" + str(xref_at).encode() + b"\n%%EOF\n")
     return bytes(out)
+
+
+@pytest.fixture(autouse=True)
+def _no_publisher_stays_stopped_between_tests():
+    """The rate limiter's stop list is process state; one test's block must not
+    make a later test's publisher unreachable."""
+    yield
+    from fetchpdf.retrieval import ratelimit
+    if ratelimit._SHARED_LIMITER is not None:
+        ratelimit._SHARED_LIMITER.reset_blocks()
+    ratelimit._local.__dict__.pop("refused", None)

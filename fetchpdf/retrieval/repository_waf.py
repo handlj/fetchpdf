@@ -42,6 +42,7 @@ import time
 from typing import Optional
 
 from . import blocked
+from . import ratelimit as _ratelimit
 
 #: Hosts observed to serve a JS bot-challenge in front of their API. Keyed by
 #: host so a repository that later drops the challenge can simply be removed.
@@ -130,8 +131,9 @@ def fetch_json_through_browser(api_url: str, doi: str, ctx) -> Optional[dict]:
             try:
                 page = browser.new_context(
                     viewport={"width": 1400, "height": 900}).new_page()
-                page.goto(landing_template.format(doi=doi),
-                          wait_until="domcontentloaded", timeout=60000)
+                landing = landing_template.format(doi=doi)
+                _ratelimit.pace_navigation(landing)    # one token per navigation
+                page.goto(landing, wait_until="domcontentloaded", timeout=60000)
 
                 deadline = time.time() + _CHALLENGE_TIMEOUT_S
                 while time.time() < deadline:
@@ -143,6 +145,7 @@ def fetch_json_through_browser(api_url: str, doi: str, ctx) -> Optional[dict]:
                     ctx.log("    repository WAF: challenge did not clear")
                     return None
 
+                _ratelimit.pace_navigation(api_url)
                 response = page.request.get(api_url, timeout=60000)
                 if response.status != 200:
                     ctx.log(f"    repository WAF: API still {response.status} after challenge")

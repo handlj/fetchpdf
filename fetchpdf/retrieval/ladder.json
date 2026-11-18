@@ -346,23 +346,59 @@
       "rps": 2,
       "burst": 2
     },
+    "_publisher_buckets_comment": [
+      "Hosts naming the same \"bucket\" share ONE allowance: a publisher's rule",
+      "is per publisher, not per hostname, so its article pages, PDF endpoints",
+      "and CDNs draw on one token bucket. Give every member the same rps/burst.",
+      "An entry also covers its subdomains (wiley.com -> onlinelibrary.wiley.com,",
+      "agupubs.onlinelibrary.wiley.com); an exact entry wins over a parent one.",
+      "Browser routes (institutional, LibKey, Atypon) take one token per",
+      "navigation or in-page PDF request, from the same buckets."
+    ],
+    "wiley.com": {
+      "_comment": "Wiley asks for at least 10 s between requests (TDM/robot policy).",
+      "bucket": "wiley",
+      "rps": 0.1,
+      "burst": 1
+    },
     "media.springernature.com": {
-      "rps": 2,
-      "burst": 2
+      "_comment": "Springer Nature asks for at least 1 s between requests; all its hosts share it.",
+      "bucket": "springernature",
+      "rps": 1,
+      "burst": 1
     },
     "static-content.springer.com": {
-      "rps": 2,
-      "burst": 2
+      "bucket": "springernature",
+      "rps": 1,
+      "burst": 1
     },
     "ars.els-cdn.com": {
       "rps": 2,
       "burst": 2
     },
     "www.nature.com": {
+      "bucket": "springernature",
       "rps": 1,
       "burst": 1
     },
     "link.springer.com": {
+      "bucket": "springernature",
+      "rps": 1,
+      "burst": 1
+    },
+    "www.sciencedirect.com": {
+      "_comment": "Elsevier's website and PDF host, same convention as the other publisher sites. The TDM API (api.elsevier.com) keeps its own bucket.",
+      "bucket": "elsevier-web",
+      "rps": 1,
+      "burst": 1
+    },
+    "pdf.sciencedirectassets.com": {
+      "bucket": "elsevier-web",
+      "rps": 1,
+      "burst": 1
+    },
+    "libkey.io": {
+      "_comment": "LibKey (Third Iron) link resolver: one token per article page and per DOWNLOAD PDF hop. The provider it forwards to (EBSCO, Ovid, a publisher) takes its own token.",
       "rps": 1,
       "burst": 1
     },

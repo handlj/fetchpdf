@@ -14,8 +14,12 @@ import threading
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import requests
 import urllib3
+# Every request this module makes goes through the per-host rate limiter: a
+# drop-in for the requests module whose get/head/post/Session are paced at the
+# transport adapter (each redirect hop included). Publisher limits live in
+# retrieval/ladder.json -> rate_limits. See retrieval/ratelimit.py.
+from .retrieval.ratelimit import paced_requests as requests
 from requests.exceptions import SSLError
 
 # .env.local is loaded here, at import time -- see _env.py.
@@ -295,7 +299,8 @@ def _crossref_get(url: str, params=None, timeout=20, retries=3, verbose=False):
     if _DEFAULT_EMAIL:
         params.setdefault("mailto", _DEFAULT_EMAIL)
     for attempt in range(retries):
-        _crossref_bucket().acquire()
+        # The token is taken by the paced adapter under `requests.get`, from
+        # this same shared bucket; taking one here too would halve the rate.
         try:
             r = requests.get(url, params=params, timeout=timeout)
         except Exception as e:
@@ -334,8 +339,7 @@ def _crossref_raw_get(url: str, **kwargs):
     token from the SAME bucket as everything else: ten workers each politely
     keeping to 10/s is 100/s, which is how a --workers 10 run got 429ed.
     """
-    _crossref_bucket().acquire()
-    return requests.get(url, **kwargs)
+    return requests.get(url, **kwargs)   # paced: the adapter takes the token
 
 
 def _retry_after_seconds(response):
@@ -384,11 +388,9 @@ def _datacite_title(doi: str, verbose=False):
     Returns `("", "")` for a DOI DataCite genuinely does not have, which IS an
     answer, versus None for a request that failed, which is not.
     """
-    from .retrieval.ratelimit import shared_host_limiter
-
     url = "https://api.datacite.org/dois/" + quote_plus((doi or "").strip().lower())
     try:
-        shared_host_limiter().bucket("api.datacite.org").acquire()
+        # Paced by the adapter under requests.get (api.datacite.org's bucket).
         r = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
     except Exception as e:
         if verbose:
@@ -6481,6 +6483,9 @@ def _batch_fetch_pdfs_inner(dois, output_dir, email=None, verbose=False, delay=0
     def download_one(doi, idx, total):
         """Download one record, registered in-flight so a stall is nameable."""
         _inflight_start(idx, str(doi).strip())
+        # Scope "which stopped publishers did this record need" to this record.
+        from .retrieval.ratelimit import begin_record as _begin_record
+        _begin_record()
         # Filled in by the inner call once it knows the record's directory, so
         # the cleanup below runs even when that call raises.
         made_dir = []
@@ -6707,12 +6712,22 @@ def _batch_fetch_pdfs_inner(dois, output_dir, email=None, verbose=False, delay=0
                 print(f"[{_tally()}] ❌ {display_id} - Nothing worked 🙃🙃🙃")
             if create_missing_report and _run_timestamp:
                 _append_missing_to_report(output_dir, display_id, _run_timestamp, _missing_report_lock)
+            # A publisher this run stopped asking (a challenge a real browser
+            # could not clear, or a run of 429s) kept this record from a route
+            # that might have worked: "blocked", not "nothing exists", so the
+            # retry list says a person has to look first.
+            from .retrieval.ratelimit import record_refusals as _record_refusals
+            _refused = _record_refusals()
+            if _refused:
+                print(f"  ⛔ {display_id}: not asked at {', '.join(_refused)} "
+                      f"(stopped for this run)")
             # Always write machine-readable retry CSV (even without HTML report)
             try:
                 _append_failed_to_csv(
                     output_dir, display_id,
-                    category="all_sources_failed",
-                    detail="",
+                    category="blocked" if _refused else "all_sources_failed",
+                    detail=("publisher stopped for this run: " + ", ".join(_refused)
+                            if _refused else ""),
                     lock=_missing_report_lock,
                 )
             except Exception as _e:
@@ -7222,6 +7237,14 @@ def _print_institutional_report():
         print("\n🔐 Institutional access:")
         for line in lines:
             print(f"    {line}")
+    from .retrieval.ratelimit import blocked_summary
+    stopped = blocked_summary()
+    if stopped:
+        print("\n⛔ Publishers stopped during this run (records marked 'blocked' in "
+              "failed_dois.csv):")
+        for line in stopped:
+            print(f"    {line}")
+        print("    Check these by hand (and with the library) before retrying them.")
 
 
 def _playwright_installed() -> bool:
@@ -8187,6 +8210,10 @@ def _main(argv=None, json_out=None):
     from .retrieval import display as _display
     if args.browser_windows:
         _display.set_browser_windows(args.browser_windows)
+    # --verbose also names each long rate-limit wait, so a deliberately slow
+    # publisher (Wiley: one request per 10 s) does not read as a hang.
+    from .retrieval import ratelimit as _ratelimit
+    _ratelimit.set_verbose(getattr(args, "verbose", False))
     from .retrieval import institutional as _institutional
     if args.no_cookies:
         _institutional.disable_cookies()

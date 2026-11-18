@@ -29,6 +29,7 @@ from typing import List, Optional
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from . import institutional as inst
+from . import ratelimit as _ratelimit
 from .blocked import CHALLENGE_TITLE_RE
 from .display import browser_launch_args, browser_launch_env
 
@@ -162,6 +163,7 @@ def fetch_via_libkey(doi, save_path, user_agent=None, verbose=False) -> Optional
         except Exception:      # noqa: BLE001 - CORS, page mid-navigation
             pass
         try:
+            _ratelimit.pace_navigation(url)
             response = context.request.get(url, timeout=60000)
             body = response.body() if response.ok else b""
         except Exception:      # noqa: BLE001
@@ -192,6 +194,9 @@ def fetch_via_libkey(doi, save_path, user_agent=None, verbose=False) -> Optional
                 context.on("response", _on_response)
                 context.on("page", _on_page)
                 page = context.new_page()
+                # One token per navigation, from libkey.io's bucket; the hop
+                # to the provider takes the next one (see ladder.json).
+                _ratelimit.pace_navigation(start)
                 page.goto(start, wait_until="domcontentloaded", timeout=60000)
                 link = _libkey_link(page, LIBKEY_LINKS_WAIT_S)
                 if not link:
@@ -201,6 +206,7 @@ def fetch_via_libkey(doi, save_path, user_agent=None, verbose=False) -> Optional
                     return None
                 if verbose:
                     print(f"  libkey: {start} -> {link}")
+                _ratelimit.pace_navigation(link)
                 try:
                     page.goto(link, wait_until="domcontentloaded", timeout=60000)
                 except Exception:      # noqa: BLE001 - "Download is starting", slow IdP
@@ -229,6 +235,10 @@ def fetch_via_libkey(doi, save_path, user_agent=None, verbose=False) -> Optional
                         page.wait_for_timeout(1000)
                         if _bot_wall(page) and not captured and not downloads:
                             host = urlsplit(page.url or "").hostname or ""
+                            # The provider (EBSCO, Ovid, ScienceDirect, ...)
+                            # refused a real browser: stop asking it this run.
+                            _ratelimit.mark_blocked(
+                                host, "bot check did not clear in a real browser")
                             if verbose:
                                 if "sciencedirect.com" in host:
                                     print("  libkey: ScienceDirect bot check -- use the "

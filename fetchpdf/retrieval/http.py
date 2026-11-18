@@ -30,7 +30,7 @@ from requests.exceptions import (
 from . import blocked as _blocked
 from .._env import EMAIL as _DEFAULT_EMAIL
 from .._http import USER_AGENT
-from .ratelimit import HostRateLimiter
+from .ratelimit import HostRateLimiter, PacedSession
 
 #: Query parameters whose values must never appear in a log line or a sidecar.
 _SECRET_PARAMS = {"apikey", "api_key", "key", "token", "access_token", "auth"}
@@ -179,7 +179,9 @@ class HttpClient:
         self.email = email or _DEFAULT_EMAIL
         self.verbose = verbose
         self.timeout = timeout
-        self.session = requests.Session()
+        # Paced at the adapter, so every redirect hop takes a token from its
+        # own host's bucket -- not only the first URL asked for.
+        self.session = PacedSession(limiter)
         self.session.headers.update({"User-Agent": USER_AGENT})
         self.call_count = 0
 
@@ -264,7 +266,6 @@ class HttpClient:
         backoff = 0.5
         last_error = ""
         for attempt in range(max(1, retries)):
-            self.limiter.acquire(host)
             started = time.monotonic()
             try:
                 r = self.session.get(
@@ -380,7 +381,6 @@ class HttpClient:
         backoff = 1.0
         last_error = ""
         for attempt in range(max(1, retries)):
-            self.limiter.acquire(host)
             started = time.monotonic()
             try:
                 r = self.session.post(
@@ -463,7 +463,6 @@ class HttpClient:
         backoff = 0.5
         last_error = ""
         for attempt in range(max(1, retries)):
-            self.limiter.acquire(host)
             started = time.monotonic()
             temp_path = None
             try:

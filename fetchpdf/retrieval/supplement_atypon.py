@@ -40,6 +40,7 @@ import shutil
 import tempfile
 from typing import List, Optional
 
+from . import ratelimit as _ratelimit
 from .supplement_index import ROLE_SUPPLEMENT, SupplementFile
 
 #: Publishers on the Atypon platform, whose SI lives at /doi/suppl/<doi> and
@@ -147,6 +148,7 @@ def fetch_atypon_supplements(ids, ctx) -> List[SupplementFile]:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.add_init_script(
                     "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+                _ratelimit.pace_navigation(listing)   # one token per navigation
                 response = page.goto(listing, wait_until="domcontentloaded",
                                      timeout=_PAGE_TIMEOUT_MS)
                 status = response.status if response else None
@@ -168,6 +170,8 @@ def fetch_atypon_supplements(ids, ctx) -> List[SupplementFile]:
                         break
                     name = href.rsplit("/", 1)[-1].split("?")[0] or f"si_{index+1}"
                     try:
+                        # Each file is a request to the publisher: one token.
+                        _ratelimit.pace_navigation(href)
                         # A click, not a navigation -- see the module docstring.
                         # Selected by nth match rather than by full href: the
                         # DOM href is often relative while eval returns it

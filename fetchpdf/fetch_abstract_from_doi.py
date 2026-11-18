@@ -1,7 +1,7 @@
 import os
 import re
 import time
-import requests
+from .retrieval.ratelimit import paced_requests as requests  # rate-limited per host; see ratelimit.py
 from urllib.parse import quote_plus
 
 from .fetchpdf import _get_with_retries

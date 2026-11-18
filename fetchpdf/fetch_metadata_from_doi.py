@@ -1,4 +1,4 @@
-import requests
+from .retrieval.ratelimit import paced_requests as requests  # rate-limited per host; see ratelimit.py
 import time
 
 # .env.local is loaded here, at import time -- see _env.py.

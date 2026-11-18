@@ -31,7 +31,8 @@ from typing import List, Optional, Sequence, Tuple
 from html import unescape
 from urllib.parse import unquote, urljoin, urlsplit
 
-import requests
+from .ratelimit import paced_requests as requests  # rate-limited per host; see ratelimit.py
+from . import ratelimit as _ratelimit
 from requests.cookies import create_cookie
 
 from .._http import POLITE_USER_AGENT, headers_for
@@ -857,6 +858,7 @@ def _wait_off_linkinghub(page, timeout_s: float = 20.0) -> None:
 
 def fetch_pdf_in_page(page, url: str) -> Tuple[Optional[bytes], dict]:
     """fetch() *url* from inside *page*; returns (pdf bytes or None, info)."""
+    _ratelimit.pace_navigation(url)       # one token per in-page PDF request
     info = page.evaluate(_FETCH_JS, [url, MAX_PDF_BYTES])
     data = base64.b64decode(info.pop("b64")) if info.get("b64") else None
     return data, info
@@ -876,6 +878,7 @@ def navigate_for_pdf(page, url: str, referer: Optional[str] = None,
     ~600-byte stub (seen on SAGE and Science), while Atypon hosts answer
     ``?download=true`` with an attachment Playwright can save.
     """
+    _ratelimit.pace_navigation(url)       # one token per navigation
     if "download=" not in url:
         url += ("&" if "?" in url else "?") + "download=true"
     downloads = []
@@ -973,10 +976,16 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
                                               accept_downloads=True)
                 context.add_cookies(_playwright_cookies(cookies, sites))
                 page = context.new_page()
+                _ratelimit.pace_navigation(article)
                 page.goto(article, wait_until="domcontentloaded", timeout=60000)
                 if not wait_past_challenge(page):
                     if verbose:
                         print(f"  institutional (browser): challenge did not clear on {article}")
+                    # A real, headed browser was refused too: this is the
+                    # publisher saying "stop", not a plain client being sorted
+                    # out. Leave it alone for the rest of the run.
+                    _ratelimit.mark_blocked(page.url or article,
+                                            "bot challenge did not clear in a real browser")
                     return None
                 if from_landing:
                     _wait_off_linkinghub(page)
@@ -997,6 +1006,7 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
                         # Cloudflare refuses a burst of parallel workers (seen
                         # 2026-10-23 on PNAS: 2 of 6 at once, all fine singly).
                         page.wait_for_timeout(8000)
+                        _ratelimit.pace_navigation(page.url)
                         page.reload(wait_until="domcontentloaded", timeout=60000)
                         wait_past_challenge(page)
                         data, info = fetch_pdf_in_page(page, url)
@@ -1025,8 +1035,11 @@ def fetch_in_browser(doi, save_path, cookies, user_agent=None,
                     # the next fetch() runs on the publisher's origin again.
                     if page.url != landing:
                         try:
+                            _ratelimit.pace_navigation(landing)
                             page.goto(landing, wait_until="domcontentloaded", timeout=60000)
                             wait_past_challenge(page)
+                        except _ratelimit.PublisherBlocked:
+                            raise
                         except Exception:      # noqa: BLE001
                             pass
             finally:
